@@ -146,8 +146,3 @@ It's about understanding:
 
 This repository focuses on building those fundamentals through consistent examples and clean implementations.
 
----
-
-# ⭐ If you find this repository helpful, consider giving it a star and following along as I continue adding more models and real-world projects.
-
-**Happy Learning! 🚀**
