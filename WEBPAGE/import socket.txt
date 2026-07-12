@@ -1,0 +1,185 @@
+import socket
+import threading
+import json
+import time
+
+zones = {1: threading.Lock(), 2: threading.Lock(), 3: threading.Lock(), 4: threading.Lock()}
+zone_owners = {1: None, 2: None, 3: None, 4: None}
+cars = {}
+algorithm_mode = "none"
+arbitrator_semaphore = threading.Semaphore(3)
+client_sockets = []
+
+current_generation = 0
+cars_completed = 0
+
+def reset_sim():
+    global zone_owners, cars, zones, arbitrator_semaphore, current_generation, cars_completed
+    current_generation += 1 
+    zones = {1: threading.Lock(), 2: threading.Lock(), 3: threading.Lock(), 4: threading.Lock()}
+    arbitrator_semaphore = threading.Semaphore(3)
+    zone_owners = {1: None, 2: None, 3: None, 4: None}
+    cars.clear()
+    cars_completed = 0
+
+def broadcast_state():
+    while True:
+        state = {
+            "mode": algorithm_mode,
+            "zones": zone_owners,
+            "cars_completed": cars_completed,
+            "cars": {k: v for k, v in cars.items()}
+        }
+        msg = json.dumps(state) + "\n"
+        for c in client_sockets[:]:
+            try:
+                c.sendall(msg.encode('utf-8'))
+            except:
+                client_sockets.remove(c)
+        time.sleep(0.05) 
+
+def handle_car(car_id, direction, gen):
+    if direction == "N": needs = [1, 4]
+    elif direction == "E": needs = [2, 1]
+    elif direction == "S": needs = [3, 2]
+    elif direction == "W": needs = [4, 3]
+
+    cars[car_id] = {
+        "id": car_id, "direction": direction, 
+        "progress": 0, "status": "arriving",
+        "waiting_for": None, "acquired": [],
+        "algo_detail": ""
+    }
+    car = cars[car_id]
+
+    for _ in range(5):
+        if current_generation != gen: return
+        car["progress"] += 5
+        time.sleep(0.1)
+
+    car["status"] = "waiting"
+
+    global algorithm_mode
+    req_order = needs
+
+    if algorithm_mode == "prevention":
+        req_order = sorted(needs)
+        car["algo_detail"] = f"Rule: Must request F{req_order[0]} before F{req_order[1]}"
+    elif algorithm_mode == "avoidance":
+        car["algo_detail"] = "Rule: Wait for Arbitrator Token"
+    else:
+        car["algo_detail"] = f"Rule: Grab F{needs[0]} blindly"
+
+    finished_cleanly = False
+    try:
+        acquired_arbitrator = False
+        
+        if algorithm_mode == "avoidance":
+            car["waiting_for"] = "Token"
+            arbitrator_semaphore.acquire()
+            if current_generation != gen: return
+            acquired_arbitrator = True
+            car["waiting_for"] = None
+            car["algo_detail"] = "Token acquired. Safe to enter."
+
+        car["waiting_for"] = f"F{req_order[0]}"
+        zones[req_order[0]].acquire()
+        if current_generation != gen: return
+        
+        zone_owners[req_order[0]] = car_id
+        car["acquired"].append(req_order[0])
+        car["waiting_for"] = None
+        car["status"] = "entering"
+        
+        for _ in range(5):
+            if current_generation != gen: return
+            car["progress"] += 5
+            time.sleep(0.1)
+
+        car["waiting_for"] = f"F{req_order[1]}"
+        car["status"] = "waiting_middle"
+        zones[req_order[1]].acquire()
+        if current_generation != gen: return
+        
+        zone_owners[req_order[1]] = car_id
+        car["acquired"].append(req_order[1])
+        car["waiting_for"] = None
+        car["status"] = "crossing"
+
+        for _ in range(5):
+            if current_generation != gen: return
+            car["progress"] += 5
+            time.sleep(0.1)
+            
+        finished_cleanly = True
+
+    finally:
+        if current_generation == gen:
+            for z in list(car["acquired"]):
+                zone_owners[z] = None
+                zones[z].release()
+                car["acquired"].remove(z)
+                
+            if algorithm_mode == "avoidance" and acquired_arbitrator:
+                arbitrator_semaphore.release()
+            
+            car["status"] = "exiting"
+            for _ in range(5):
+                if current_generation != gen: return
+                car["progress"] += 5
+                time.sleep(0.1)
+
+            if car_id in cars:
+                del cars[car_id]
+                
+            if finished_cleanly:
+                global cars_completed
+                cars_completed += 1
+
+def handle_client(conn, addr):
+    client_sockets.append(conn)
+    car_counter = 1
+    with conn:
+        buffer = ""
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data: break
+                buffer += data.decode('utf-8')
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if not line: continue
+                    msg = json.loads(line)
+                    
+                    if msg.get("action") == "spawn":
+                        d = msg.get("direction")
+                        cid = f"P{car_counter}_{d}"
+                        car_counter += 1
+                        threading.Thread(target=handle_car, args=(cid, d, current_generation), daemon=True).start()
+                    elif msg.get("action") == "set_mode":
+                        global algorithm_mode
+                        algorithm_mode = msg.get("value")
+                    elif msg.get("action") == "reset":
+                        reset_sim()
+            except:
+                break
+    if conn in client_sockets:
+        client_sockets.remove(conn)
+
+def start_server():
+    HOST = '127.0.0.1'
+    PORT = 65432
+    threading.Thread(target=broadcast_state, daemon=True).start()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"Dining Philosophers Server running on {HOST}:{PORT}")
+        while True:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+if __name__ == "__main__":
+    start_server()
+ 
